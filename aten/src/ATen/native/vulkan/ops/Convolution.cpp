@@ -494,11 +494,31 @@ void conv2d_pointwise(
   using namespace api::utils;
 
   if (v_output.has_image() && v_input.has_image() && v_weight.has_image()) {
+    
+    vTensor v_weight_reshaped{
+        context,
+        {1,1, v_weight.sizes()[0], v_weight.sizes()[1]},
+        v_input.options(),
+    };
+
+    api::Command::Buffer command_bufferr =
+        api::context()->command().pool.allocate();
+    command_bufferr.begin();
+
+    command_bufferr.copy(
+        v_weight.buffer(command_bufferr),
+        v_weight_reshaped.buffer(command_bufferr, vTensor::Access::Write)
+    );
+
+    command_bufferr.end();
+    command_bufferr.submit(api::context()->gpu().queue);
+
     const struct {
       int32_t kernel_ic, kernel_oc;
       int32_t stride_x, stride_y;
       int32_t padding_x, padding_y;
       float clamp_x, clamp_y;
+      int32_t w;
     } block {
       safe_downcast<int32_t>(filter[Layout::Filter::input]),
       safe_downcast<int32_t>(filter[Layout::Filter::output]),
@@ -508,6 +528,7 @@ void conv2d_pointwise(
       safe_downcast<int32_t>(padding[Layout::Parameter::height]),
       output_min,
       output_max,
+      v_weight.sizes()[1],
     };
 
     context->dispatch(
@@ -516,6 +537,7 @@ void conv2d_pointwise(
           VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
           VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
           VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+          //VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
           VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
           VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
         },
@@ -529,7 +551,8 @@ void conv2d_pointwise(
         v_input.image(command_buffer),
         // Read-only access is implied on const tensors and triggers an async
         // synchronization if necessary.
-        v_weight.image(command_buffer),
+        v_weight_reshaped.image(command_buffer, vTensor::Access::Read),
+        // v_weight.image(command_buffer),
         // Read-only access is implied on const tensors and triggers an async
         // synchronization if necessary.
         v_bias.buffer(command_buffer),
