@@ -14,11 +14,5 @@ from .asgd import ASGD
 from .adamax import Adamax
 from .adadelta import Adadelta
 
-del adam
-del adamw
-del sgd
-del rmsprop
-del rprop
-del asgd
-del adamax
-del adadelta
+__all__ = ['ASGD', 'Adadelta', 'Adam', 'AdamW', 'Adamax',
+           'RMSprop', 'Rprop', 'SGD']
