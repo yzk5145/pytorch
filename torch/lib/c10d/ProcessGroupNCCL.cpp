@@ -398,7 +398,11 @@ void ProcessGroupNCCL::WorkNCCL::synchronizeInternal(
         LOG(INFO) << "[Rank " << rank_
                   << "] Caught collective operation timeout for work: "
                   << (*this);
-        throw std::runtime_error("Operation timed out!");
+        auto timeoutErr = c10::str(
+            "Operation timed out after ",
+            workTimeout.count(),
+            " milliseconds!");
+        throw std::runtime_error(timeoutErr);
       }
       // Check for errors and throw appropriate exception.
       checkAndThrowException();
