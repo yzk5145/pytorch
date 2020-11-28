@@ -13,6 +13,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAEvent.h>
+#include <ATen/cuda/CUDAMultiStreamGuard.h>
 #include <c10/core/Stream.h>
 #include <c10/core/StreamGuard.h>
 #include <c10/cuda/CUDACachingAllocator.h>
@@ -196,10 +197,8 @@ class ProcessGroupNCCL : public ProcessGroup {
   // or NCCL's barrier().
   //
   // If created by WorkNCCL's getFuture API, FutureNCCL has a reference to
-  // WorkNCCL's cudaEvents, NCCL collective's outputs, and the device index of
-  // outputs' device. Its value is NCCL collective's
-  // outputs. FutureNCCL only supports single-process single-device mode where
-  // the size of outputs is equal to 1.
+  // WorkNCCL's cudaEvents, NCCL collective's outputs, and the device indices of
+  // outputs' devices. Its value is NCCL collective's outputs.
   //
   // If created by FutureNCCL's then callback, its value becomes the value of
   // callback() and its cudaEvents will record the NCCL stream that runs that
@@ -212,20 +211,21 @@ class ProcessGroupNCCL : public ProcessGroup {
    public:
     explicit FutureNCCL(
         at::IValue value,
-        c10::DeviceIndex deviceIndex,
+        std::vector<c10::DeviceIndex> deviceIndices,
         std::shared_ptr<std::vector<at::cuda::CUDAEvent>> cudaEvents)
         : at::ivalue::Future(c10::ListType::create(c10::TensorType::get())),
           value_(std::move(value)),
-          deviceIndex_(deviceIndex),
+          deviceIndices_(std::move(deviceIndices)),
           cudaEvents_(std::move(cudaEvents)) {
       TORCH_INTERNAL_ASSERT(
-          cudaEvents_->size() == 1,
-          "FutureNCCL only supports single-process single-device mode.");
+        cudaEvents_->size() == deviceIndices_.size(),
+        "The device indices and the events must be paired up. Got ",
+        deviceIndices_.size(), " devices and ", cudaEvents_->size(),
+        " events.");
     }
 
-    explicit FutureNCCL(c10::DeviceIndex deviceIndex)
-        : at::ivalue::Future(c10::ListType::create(c10::TensorType::get())),
-          deviceIndex_(deviceIndex) {}
+    FutureNCCL()
+        : at::ivalue::Future(c10::ListType::create(c10::TensorType::get())) {}
 
     // Gets the current stream of the device and synchronizes recorded streams
     // with that. It will return after synchronizing the correct GPU streams to
@@ -235,8 +235,11 @@ class ProcessGroupNCCL : public ProcessGroup {
       if (error_) {
         throw *error_;
       }
-      auto stream = at::cuda::getCurrentCUDAStream(deviceIndex_);
-      (*cudaEvents_)[0].block(stream);
+
+      for (int i = 0; i < deviceIndices_.size(); i++) {
+        (*cudaEvents_)[i].block(
+            at::cuda::getCurrentCUDAStream(deviceIndices_[i]));
+      }
     }
 
     // If FutureNCCL was created by FutureNCCL::then, its value would be empty
@@ -251,12 +254,22 @@ class ProcessGroupNCCL : public ProcessGroup {
       value_ = std::move(value);
 
       if (cudaEvents_ == nullptr) {
-        // Create a new cudaEvents object of size 1 that will record the current
-        // stream after callback and will be passed to the new FutureNCCL.
-        cudaEvents_ = std::make_shared<std::vector<at::cuda::CUDAEvent>>(1);
-        // In case of chained then callback calls, cudaEvents
-        // records callback's stream.
-        (*cudaEvents_)[0].record(at::cuda::getCurrentCUDAStream(deviceIndex_));
+        std::vector<bool> isCudaDeviceUsed(c10::cuda::device_count(), false);
+        for (const at::DataPtr& data_ptr : extractDataPtrs(value_)) {
+          if (data_ptr.device().is_cuda()) {
+            isCudaDeviceUsed[data_ptr.device().index()] = true;
+          }
+        }
+
+        cudaEvents_ = std::make_shared<std::vector<at::cuda::CUDAEvent>>();
+        for (c10::DeviceIndex idx = 0; idx < isCudaDeviceUsed.size(); idx++) {
+          if (isCudaDeviceUsed[idx]) {
+            at::cuda::CUDAEvent cudaEvent;
+            cudaEvent.record(at::cuda::getCurrentCUDAStream(idx));
+            deviceIndices_.push_back(idx);
+            (*cudaEvents_).push_back(std::move(cudaEvent));
+          }
+        }
       }
     }
 
@@ -278,19 +291,31 @@ class ProcessGroupNCCL : public ProcessGroup {
     // this callback. This new FutureNCCL's cudaEvents will record the
     // callback's stream and will have the result value of the callback.
     void addCallback(std::function<void(void)> callback) override {
-      // FIXME Should we find a way to allow to change the priority of streams?
-      at::cuda::CUDAStream stream =
-          at::cuda::getStreamFromPool(/*isHighPriority=*/false, deviceIndex_);
+      // Get a stream for all devices, even those that are not used by the
+      // value, because the user's callback could use those other devices.
+      std::vector<at::cuda::CUDAStream> streams;
+      for (c10::DeviceIndex idx = 0; idx < c10::cuda::device_count(); idx++) {
+        // FIXME Should we find a way to allow to change the priority of
+        // streams?
+        streams.push_back(
+            at::cuda::getStreamFromPool(/*isHighPriority=*/false, idx));
+      }
 
       // Do not free the underlying data storage of value_ before its
       // usage on the stream finishes.
       for (const at::DataPtr& data_ptr : extractDataPtrs(value_)) {
-        c10::cuda::CUDACachingAllocator::recordStream(data_ptr, stream);
+        if (data_ptr.device().is_cuda()) {
+          c10::cuda::CUDACachingAllocator::recordStream(
+              data_ptr, streams[data_ptr.device().index()]);
+        }
       }
 
-      (*cudaEvents_)[0].block(stream);
+      for (int i = 0; i < deviceIndices_.size(); i++) {
+        (*cudaEvents_)[i].block(streams[deviceIndices_[i]]);
+      }
+
       // Use the dedicated callback stream to run callback.
-      c10::StreamGuard streamGuard{stream};
+      at::cuda::CUDAMultiStreamGuard streamGuard(streams);
       callback();
     }
 
@@ -300,7 +325,14 @@ class ProcessGroupNCCL : public ProcessGroup {
     c10::intrusive_ptr<Future> then(
         std::function<at::IValue(void)> callback,
         at::TypePtr /* unused */) override {
-      auto fut = c10::make_intrusive<FutureNCCL>(deviceIndex_);
+      auto fut = c10::make_intrusive<FutureNCCL>();
+      // The new future needs the DataPtr extractor when it gets marked complete
+      // but this might happen immediately inline or in parallel by another
+      // thread. In both these cases this would/might happen before the user has
+      // time to set their own DataPtr extractor, which might lead to failures
+      // if the default extractor can't handle some of the user's types.
+      // Therefore we propagate our extractor.
+      fut->setDataPtrExtractor(dataPtrExtractor_);
 
       // Cannot move capture std::function in lambda, because it cannot deduce
       // the template type for std::function. Hence use std::bind to explicitly
@@ -333,12 +365,16 @@ class ProcessGroupNCCL : public ProcessGroup {
     }
 
     void setDataPtrExtractor(DataPtrExtractor data_ptr_extractor) override {
-      dataPtrExtractor_ = std::move(data_ptr_extractor);
+      // To avoid races with other threads that may be using the extractor, we
+      // won't modify it after it's first set.
+      if (dataPtrExtractor_ == nullptr) {
+        dataPtrExtractor_ = std::move(data_ptr_extractor);
+      }
     }
 
    private:
     at::IValue value_;
-    c10::DeviceIndex deviceIndex_;
+    std::vector<c10::DeviceIndex> deviceIndices_;
     std::shared_ptr<std::vector<at::cuda::CUDAEvent>> cudaEvents_;
     DataPtrExtractor dataPtrExtractor_;
     c10::optional<FutureError> error_;
