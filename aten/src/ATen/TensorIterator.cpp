@@ -475,17 +475,38 @@ void TensorIteratorBase::allocate_or_resize_outputs() {
         }
       }
       auto tensor_shape = invert_perm(shape_);
+
+      // For quantized output tensors, get the quantization params from the
+      // input.
+      c10::optional<TensorQuantizationOptions> quant_options = c10::nullopt;
+      const auto& options = op.options();
+      if (options.dtype() == at::kQInt8 || options.dtype() == at::kQUInt8 ||
+          options.dtype() == at::kQInt32) {
+        // get the first input and copy its quantization parameters
+        const auto& first_input = operands_[num_outputs_];
+        TORCH_INTERNAL_ASSERT_DEBUG_ONLY(first_input.tensor.is_quantized());
+        TORCH_INTERNAL_ASSERT(
+            first_input.tensor.qscheme() == c10::kPerTensorAffine ||
+            first_input.tensor.qscheme() == c10::kPerTensorSymmetric,
+            "Advanced indexing of per-channel quantized tensors is not supported yet");
+        quant_options = TensorQuantizationOptions(
+            first_input.tensor.q_scale(), first_input.tensor.q_zero_point());
+      }
+
       if (inverted) {
         // can just return contiguous output
         // it is faster because it avoids allocating 0 size tensor and
         // resizing and restriding it
-        set_output(i, tensor_shape, {}, op.options(), names_);
+        set_output(
+            i, tensor_shape, {}, op.options(), names_, quant_options);
       } else {
         auto tensor_stride = invert_perm(op.stride_bytes);
         for (int dim = 0; dim < ndim(); dim++) {
           tensor_stride[dim] /= element_size;
         }
-        set_output(i, tensor_shape, tensor_stride, op.options(), names_);
+        set_output(
+            i, tensor_shape, tensor_stride, op.options(), names_,
+            quant_options);
       }
       op.current_dtype = op.target_dtype;
     } else if (op.tensor.defined() && !names_.empty()) {
@@ -1281,12 +1302,25 @@ void TensorIteratorBase::build(TensorIteratorConfig& config) {
   view_offsets_ = DimVector(ndim_offsets, 0);
 }
 
-void TensorIterator::set_output(int64_t output_idx, IntArrayRef sizes, IntArrayRef strides, TensorOptions options, DimnameList names) {
+void TensorIterator::set_output(
+    int64_t output_idx, IntArrayRef sizes, IntArrayRef strides,
+    TensorOptions options, DimnameList names,
+    c10::optional<TensorQuantizationOptions> quant_options) {
   auto& op = operands_[output_idx];
   TORCH_INTERNAL_ASSERT_DEBUG_ONLY(output_idx < num_outputs_);
   if (!op.tensor.defined()) {
       if (strides.empty()) {
-          op.tensor = at::empty(sizes, options);
+          if (options.dtype() == at::kQInt8 || options.dtype() == at::kQUInt8 ||
+              options.dtype() == at::kQInt32) {
+            // quantized path
+            TORCH_INTERNAL_ASSERT(quant_options.has_value());
+            op.tensor = at::_empty_affine_quantized(
+                sizes, options, (*quant_options).q_scale,
+                (*quant_options).q_zero_point);
+          } else {
+            // non-quantized path
+            op.tensor = at::empty(sizes, options);
+          }
       } else {
           op.tensor = at::empty_strided(sizes, strides, options);
       }
